@@ -15,9 +15,6 @@ jobs:
         with:
           gradle-version: 8.9
       - run: echo "android.useAndroidX=true" > gradle.properties
-      # TAMBAHAN: kalau ada res-icons.zip di root repo, otomatis extract
-      # isinya (icon app) ke folder res sebelum build, jadi tidak perlu
-      # upload file gambar satu-satu secara manual.
       - name: Extract icon jika ada
         run: |
           if [ -f res-icons.zip ]; then
