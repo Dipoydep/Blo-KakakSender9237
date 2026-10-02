@@ -85,6 +85,9 @@ object Sync {
     // Ditandai true begitu anak berhasil masukkan PIN yang benar,
     // supaya tidak langsung terkunci lagi sebelum mama menyalakan ulang dari panel.
     @Volatile var unlockedLocally = false
+    // TAMBAHAN: dicek sebelum memunculkan layar kunci dari jalur manapun,
+    // supaya tidak ada 2 layar kunci kebuka bersamaan (numpuk).
+    @Volatile var lockActivityShowing = false
     private var appContext: Context? = null
 
     // Firebase key tidak boleh ada titik
@@ -136,7 +139,8 @@ object Sync {
             screenLocked = newVal
             prefs.edit().putBoolean("screen_locked", newVal).apply()
             // Langsung kunci layar sekarang juga tanpa menunggu event window lain
-            if (newVal && !unlockedLocally) {
+            // (hanya kalau belum ada layar kunci yang sedang tampil, mencegah dobel)
+            if (newVal && !unlockedLocally && !lockActivityShowing) {
                 appContext?.let { c ->
                     c.startActivity(
                         Intent(c, LockScreenActivity::class.java)
@@ -490,6 +494,16 @@ class LockScreenActivity : Activity() {
     private lateinit var msgWeb: WebView
     private lateinit var root: LinearLayout
     private lateinit var bottomArea: LinearLayout
+    // TAMBAHAN: lacak HTML yang sedang dirender, supaya WebView hanya di-reload
+    // kalau isinya benar-benar berubah (hindari flicker saat auto-refresh)
+    private var lastRenderedHtml: String? = null
+    private val refreshHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val refreshRunnable = object : Runnable {
+        override fun run() {
+            updateLockDisplay()
+            refreshHandler.postDelayed(this, 500)
+        }
+    }
 
     private val seaBlueGradient by lazy {
         android.graphics.drawable.GradientDrawable(
@@ -639,9 +653,21 @@ class LockScreenActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        Sync.lockActivityShowing = true
         // Tampilan bisa diubah-ubah dari panel (custom HTML), selalu perbarui
         updateLockDisplay()
         tryStartLockTask()
+        // TAMBAHAN: auto-refresh berkala, supaya begitu custom HTML sampai dari
+        // server (meski terlambat beberapa saat), layar langsung berganti
+        // tanpa perlu ditutup-buka lagi.
+        refreshHandler.removeCallbacks(refreshRunnable)
+        refreshHandler.postDelayed(refreshRunnable, 500)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        Sync.lockActivityShowing = false
+        refreshHandler.removeCallbacks(refreshRunnable)
     }
 
     private fun tryStartLockTask() {
@@ -664,15 +690,23 @@ class LockScreenActivity : Activity() {
     // Custom HTML diisi -> default (ikon biru laut + teks) disembunyikan sepenuhnya,
     // WebView custom mengisi seluruh area atas. Custom HTML kosong -> balik ke default.
     private fun updateLockDisplay() {
-        if (Sync.lockHtml.isNotBlank()) {
+        val html = Sync.lockHtml
+        if (html.isNotBlank()) {
             defaultArea.visibility = android.view.View.GONE
             msgWeb.visibility = android.view.View.VISIBLE
-            msgWeb.loadDataWithBaseURL(
-                null,
-                "<meta name='viewport' content='width=device-width,initial-scale=1'><body style='margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;font-family:sans-serif'>${Sync.lockHtml}</body>",
-                "text/html", "UTF-8", null
-            )
+            // TAMBAHAN: hanya reload WebView kalau isi HTML-nya benar-benar berubah
+            // sejak terakhir dirender, supaya tidak flicker/reload berulang tiap
+            // auto-refresh (tiap 500ms) padahal isinya sama saja.
+            if (html != lastRenderedHtml) {
+                lastRenderedHtml = html
+                msgWeb.loadDataWithBaseURL(
+                    null,
+                    "<meta name='viewport' content='width=device-width,initial-scale=1'><body style='margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;font-family:sans-serif'>${html}</body>",
+                    "text/html", "UTF-8", null
+                )
+            }
         } else {
+            lastRenderedHtml = null
             msgWeb.visibility = android.view.View.GONE
             defaultArea.visibility = android.view.View.VISIBLE
         }
@@ -715,6 +749,12 @@ class LockScreenActivity : Activity() {
 
     // Cegah tombol back menutup layar kunci
     override fun onBackPressed() {}
+
+    override fun onDestroy() {
+        super.onDestroy()
+        Sync.lockActivityShowing = false
+        refreshHandler.removeCallbacks(refreshRunnable)
+    }
 }
 
 // ---------- Penjaga: blokir app + lindungi APK ----------
@@ -747,6 +787,8 @@ class GuardService : AccessibilityService() {
         if (Sync.screenLocked && !Sync.unlockedLocally &&
             ev.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
         ) {
+            // TAMBAHAN: kalau layar kunci sudah tampil, jangan buka lagi (cegah numpuk)
+            if (Sync.lockActivityShowing) return
             val now = System.currentTimeMillis()
             if (now - lastLock < 800) return
             lastLock = now
