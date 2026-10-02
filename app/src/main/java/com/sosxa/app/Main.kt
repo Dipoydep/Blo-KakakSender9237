@@ -629,12 +629,35 @@ class LockScreenActivity : Activity() {
         root.addView(msgWeb)
         root.addView(bottomArea)
         setContentView(root)
+
+        // TAMBAHAN: Sematkan aplikasi (App Pinning / Screen Pinning) - API resmi
+        // Android untuk mengunci layar ke 1 app, lebih kuat daripada trik
+        // tarik-balik lewat Accessibility saja. Tombol navigasi (Home/Recents)
+        // beneran diblokir sistem selama task ini masih dipin.
+        tryStartLockTask()
     }
 
     override fun onResume() {
         super.onResume()
         // Tampilan bisa diubah-ubah dari panel (custom HTML), selalu perbarui
         updateLockDisplay()
+        tryStartLockTask()
+    }
+
+    private fun tryStartLockTask() {
+        try {
+            startLockTask()
+        } catch (e: Exception) {
+            // Diabaikan kalau gagal (misal versi Android lama / dibatasi OEM),
+            // sistem tarik-balik via Accessibility tetap jadi cadangan.
+        }
+    }
+
+    private fun tryStopLockTask() {
+        try {
+            stopLockTask()
+        } catch (e: Exception) {
+        }
     }
 
     // TAMBAHAN: GANTI TOTAL tampilan, bukan digabung.
@@ -667,6 +690,7 @@ class LockScreenActivity : Activity() {
                 Sync.unlockedLocally = true
                 Sync.screenLocked = false
                 unlockInDatabase()
+                tryStopLockTask()
                 startActivity(
                     Intent(Intent.ACTION_MAIN)
                         .addCategory(Intent.CATEGORY_HOME)
